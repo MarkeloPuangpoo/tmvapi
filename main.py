@@ -30,38 +30,51 @@ def read_root():
 
 @app.post("/api/redeem")
 def redeem_api(req: RedeemRequest, x_api_key: str = Header(None)):
-    # 1. เช็คว่าใส่ API Key มาไหม
+    # 1. เช็ค API Key
     if not x_api_key:
         raise HTTPException(status_code=401, detail="Missing API Key in headers")
     
-    # 2. วิ่งไปค้นหา API Key ในฐานข้อมูล Supabase ตาราง 'api_keys'
+    # 2. ค้นหา API Key ในฐานข้อมูล
     try:
         response = supabase.table("api_keys").select("*").eq("api_key", x_api_key).execute()
         records = response.data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database connection error: {str(e)}")
 
-    # 3. ตรวจสอบว่าเจอ Key นี้ไหม
     if not records or len(records) == 0:
         raise HTTPException(status_code=403, detail="Invalid API Key")
 
-    user_data = records[0] # ข้อมูลลูกค้าเจ้าของ Key นี้
-    
-    # 4. ดึงเบอร์โทรที่ลูกค้าผูกไว้ (Hardware Binding)
+    user_data = records[0] 
+    api_key_id = user_data.get("id") # ดึง ID ของคีย์นี้มาเพื่อใช้เป็น Foreign Key
     locked_phone = user_data.get("locked_phone")
+    
     if not locked_phone:
-        raise HTTPException(status_code=400, detail="No phone number bound to this API Key. Please bind it on the dashboard.")
+        raise HTTPException(status_code=400, detail="No phone number bound to this API Key.")
 
-    # 5. (Optional) เช็คโควต้าว่าเหลือไหม
-    # if user_data.get("plan_type") == "starter" and user_data.get("quota_left", 0) <= 0:
-    #     raise HTTPException(status_code=402, detail="Quota exceeded. Please top up.")
-
-    # 6. ส่งลิงก์กับเบอร์โทรที่ดึงจาก DB ไปรับเงิน
+    # 3. ส่งลิงก์กับเบอร์โทรไปรับเงิน
     result = redeem_truemoney_voucher(req.link, locked_phone)
 
-    # 7. (Optional) ถ้าตั้งใจจะหักโควต้าเมื่อรับซองสำเร็จ ให้เขียนอัปเดต DB ตรงนี้
-    # if result["status"] == "success" and user_data.get("plan_type") == "starter":
-    #     new_quota = user_data["quota_left"] - 1
-    #     supabase.table("api_keys").update({"quota_left": new_quota}).eq("api_key", x_api_key).execute()
+    # 4. 📝 [ส่วนที่เพิ่มใหม่] บันทึกประวัติลงตาราง api_logs
+    log_status = result.get("status", "error")
+    log_amount = result.get("amount", 0.0) if log_status == "success" else 0.0
+
+    try:
+        supabase.table("api_logs").insert({
+            "api_key_id": api_key_id,
+            "voucher_link": req.link,
+            "status": log_status,
+            "amount": log_amount
+        }).execute()
+    except Exception as e:
+        # พิมพ์ Error ไว้ดูใน Log ของ Render แต่ไม่ต้องทำให้ API พัง เพราะลูกค้ารับเงินไปแล้ว
+        print(f"Failed to save log: {str(e)}")
+
+    # 5. หักโควต้า (ถ้าเป็นแพ็กเกจ starter และรับซองสำเร็จ)
+    if log_status == "success" and user_data.get("plan_type") == "starter":
+        new_quota = user_data.get("quota_left", 0) - 1
+        try:
+            supabase.table("api_keys").update({"quota_left": new_quota}).eq("api_key", x_api_key).execute()
+        except Exception as e:
+            print(f"Failed to update quota: {str(e)}")
 
     return result
